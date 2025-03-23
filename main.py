@@ -1,19 +1,22 @@
 import os
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict
 from langchain.embeddings import CacheBackedEmbeddings
 from langchain.storage import LocalFileStore
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PDFPlumberLoader
+from langchain_community.document_loaders import CSVLoader
 from langchain_community.vectorstores.faiss import FAISS
 from langchain_core.prompts import load_prompt
 from langchain_ollama import OllamaEmbeddings, ChatOllama
+from langchain_core.documents import Document
 import logging
 import traceback
+import pandas as pd
+import uuid
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +25,7 @@ logger = logging.getLogger(__name__)
 # 환경 변수 설정
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "ggml-model-Q5_K_M")
 CACHE_DIR = ".cache/embeddings"
+FAISS_INDEX_DIR = ".cache/files"
 
 app = FastAPI(title="100% 오픈모델 RAG API")
 
@@ -36,12 +40,17 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     question: str
+    session_id: str
 
 class ChatResponse(BaseModel):
     answer: str
 
-# 전역 변수로 체인 저장
-chain = None
+class UploadResponse(BaseModel):
+    session_id: str
+    message: str
+
+# 세션별 체인 저장
+chains: Dict[str, object] = {}
 
 def create_chain(vectorstore):
     """벡터스토어를 사용하여 체인 생성"""
@@ -73,23 +82,30 @@ def create_chain(vectorstore):
         logger.error(traceback.format_exc())
         return None
 
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    """PDF 파일 업로드 및 처리"""
-    global chain
+def process_csv_file(file_path: str):
+    """CSV 파일 처리 및 벡터스토어 생성"""
     try:
-        # 파일 저장
-        file_path = f"./.cache/files/{file.filename}"
-        with open(file_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
+        # CSV 파일 읽기
+        df = pd.read_csv(file_path)
+        
+        # 문서 생성
+        docs = []
+        for _, row in df.iterrows():
+            content = f"category: {row['category']}\ntype: {row['type']}\ntitle: {row['title']}\ncontent: {row['content']}"
+            doc = Document(
+                page_content=content,
+                metadata={
+                    "source": file_path,
+                    "category": row['category'],
+                    "type": row['type'],
+                    "title": row['title']
+                }
+            )
+            docs.append(doc)
 
         # Splitter 설정
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-
-        # 문서 로드
-        loader = PDFPlumberLoader(file_path)
-        docs = loader.load_and_split(text_splitter=text_splitter)
+        split_docs = text_splitter.split_documents(docs)
 
         # 캐싱을 지원하는 임베딩 설정
         embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
@@ -98,15 +114,44 @@ async def upload_file(file: UploadFile = File(...)):
         )
 
         # 벡터 DB 저장
-        vectorstore = FAISS.from_documents(docs, embedding=cached_embeddings)
-        vectorstore.save_local(".cache/files")
+        vectorstore = FAISS.from_documents(split_docs, embedding=cached_embeddings)
+        vectorstore.save_local(FAISS_INDEX_DIR)
+
+        return vectorstore
+    except Exception as e:
+        logger.error(f"Error processing CSV file: {str(e)}")
+        logger.error(traceback.format_exc())
+        return None
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload_file(file: UploadFile = File(...)):
+    """CSV 파일 업로드 및 처리"""
+    try:
+        # 세션 ID 생성
+        session_id = str(uuid.uuid4())
+        
+        # 파일 저장
+        file_path = f"./.cache/files/{session_id}_{file.filename}"
+        os.makedirs("./.cache/files", exist_ok=True)
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+
+        # CSV 파일 처리
+        vectorstore = process_csv_file(file_path)
+        if vectorstore is None:
+            raise HTTPException(status_code=500, detail="Failed to process CSV file")
 
         # 체인 생성
         chain = create_chain(vectorstore)
         if chain is None:
             raise HTTPException(status_code=500, detail="Failed to create chain")
-
-        return {"message": "File processed successfully"}
+        
+        # 세션에 체인 저장
+        chains[session_id] = chain
+        
+        logger.info(f"File processed successfully with session ID: {session_id}")
+        return UploadResponse(session_id=session_id, message="File processed successfully")
     except Exception as e:
         logger.error(f"Error processing file: {str(e)}")
         logger.error(traceback.format_exc())
@@ -116,12 +161,13 @@ async def upload_file(file: UploadFile = File(...)):
 async def chat(request: ChatRequest):
     """채팅 요청 처리"""
     try:
-        if chain is None:
+        if request.session_id not in chains:
             raise HTTPException(
-                status_code=500,
-                detail="No document has been uploaded yet. Please upload a document first."
+                status_code=404,
+                detail="Session not found. Please upload a file first."
             )
         
+        chain = chains[request.session_id]
         logger.info(f"Processing chat request: {request.question}")
         response = chain.invoke(request.question)
         return ChatResponse(answer=response)
